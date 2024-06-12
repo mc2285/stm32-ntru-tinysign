@@ -1,8 +1,13 @@
 use serialport::{available_ports, Error, SerialPort, SerialPortInfo, SerialPortType};
-use std::{process::ExitCode, time::Duration};
+use std::{process::ExitCode, thread::sleep, time::{Duration, Instant}, vec};
 
-const SERIAL_TIMEOUT: std::time::Duration = Duration::from_millis(300);
+const SERIAL_TIMEOUT: std::time::Duration = Duration::from_millis(400);
+const INIT_TIMEOUT: std::time::Duration = Duration::from_millis(1500);
+const CMD_TIMEOUT: std::time::Duration = Duration::from_millis(3000);
+const PROBE_GRANUALITY: std::time::Duration = Duration::from_millis(25);
 
+/// Locates a device with the correct VID/PID and manufacturer/product
+/// strings in the list of ports returned by `serialport::available_ports`
 fn locate_token(mut ports: Vec<SerialPortInfo>) -> Option<String> {
     loop {
         let port = ports.pop()?;
@@ -18,58 +23,77 @@ fn locate_token(mut ports: Vec<SerialPortInfo>) -> Option<String> {
     }
 }
 
+/// Initializes communication with the device by sending a newline and waiting
+/// for the device to send a response ending with a newline.
+/// Will timeout after INIT_TIMEOUT milliseconds of no response.
 fn init_communication(port: &mut Box<dyn SerialPort>) -> Result<(), Error> {
     port.set_timeout(SERIAL_TIMEOUT)?;
     port.write("\r\n".as_bytes())?;
-    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let mut buf: Vec<u8> = vec![0; 64];
     let mut res: Vec<u8> = Vec::with_capacity(1024);
-    let mut fail_cnt = 0;
+    let start = Instant::now();
     loop {
-        match port.read_to_end(&mut buf) {
-            Ok(_) | Err(_) => {
-                if buf.len() > 0 {
+        match port.read(&mut buf) {
+            Ok(n_read) => {
+                if n_read > 0 {
                     res.extend_from_slice(&buf);
-                } else {
-                    fail_cnt += 1;
+                    buf = vec![0; 64];
                 }
-                buf.clear();
             }
+            Err(_) => {}
         }
-        if fail_cnt > Duration::from_millis(1500).as_millis() / SERIAL_TIMEOUT.as_millis() {
-            return Err(Error::new(serialport::ErrorKind::NoDevice, "No response"));
-        }
-        if res.ends_with(b"\r\n") {
+        if res.iter().filter(|&&c| c == b'\n').count() > 0 {
             return Ok(());
         }
+        if Instant::now().duration_since(start) > INIT_TIMEOUT {
+            return Err(Error::new(serialport::ErrorKind::NoDevice, "No response"));
+        }
+        sleep(PROBE_GRANUALITY);
     }
 }
 
+/// Sends a command to the device and awaits n newline-terminated responses.
+/// Will timeout after CMD_TIMEOUT milliseconds of no response.
 fn send_and_read_resp(
     port: &mut Box<dyn SerialPort>,
     res: &mut Vec<u8>,
     cmd: &[u8],
+    mut n: i32,
 ) -> Result<(), Error> {
     port.write_all(&cmd)?;
-
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let mut fail_cnt = 0;
+    let mut buf: Vec<u8> = vec![0; 64];
+    let start = Instant::now();
     loop {
-        match port.read_to_end(&mut buf) {
-            Ok(_) | Err(_) => {
-                if buf.len() > 0 {
+        match port.read(&mut buf) {
+            Ok(n_read)  => {
+                if n_read > 0 {
                     res.extend_from_slice(&buf);
-                } else {
-                    fail_cnt += 1;
+                    n -= buf.iter().filter(|&&c| c == b'\n').count() as i32;
+                    buf = vec![0; 64];
                 }
-                buf.clear();
             }
+            Err(_) => {}
         }
-        if fail_cnt > Duration::from_millis(3000).as_millis() / SERIAL_TIMEOUT.as_millis() {
-            return Err(Error::new(serialport::ErrorKind::NoDevice, "No response"));
-        }
-        if res.ends_with(b"\r\n") {
+        if n <= 0 {
+            while n <= 0 {
+                if res[res.len()-1] == b'\n' {
+                    res.pop();
+                    if res[res.len()-2] == b'\r'
+                    {
+                        res.pop();
+                    }
+                    n += 1;
+                }
+                else {
+                    res.pop();
+                }
+            }
             return Ok(());
         }
+        if Instant::now().duration_since(start) > CMD_TIMEOUT {
+            return Err(Error::new(serialport::ErrorKind::NoDevice, "No response"));
+        }
+        sleep(PROBE_GRANUALITY);
     }
 }
 
@@ -100,11 +124,16 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let mut buffer: Vec<u8> = Vec::with_capacity(10240); 
+    // Response buffer
+    let mut buffer: Vec<u8> = Vec::with_capacity(10240);
     let cmd = "AT+I\r\n".as_bytes();
-    if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd) {
+    if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd, 4) {
         eprintln!("Error: {}", e);
         return ExitCode::FAILURE;
     }
+    println!(
+        "Found a token! Device info: \n{}",
+        String::from_utf8_lossy(&buffer)
+    );
     return ExitCode::SUCCESS;
 }
