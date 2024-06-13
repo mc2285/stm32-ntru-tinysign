@@ -2,7 +2,7 @@ use chrono::DateTime;
 use serialport::{available_ports, Error, SerialPort, SerialPortInfo, SerialPortType};
 use sha3::{Digest, Sha3_512};
 use std::{
-    io::Write,
+    io::{self, Write},
     process::ExitCode,
     thread::sleep,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -161,6 +161,7 @@ fn main() -> ExitCode {
         eprintln!("Argument required: path to file to sign");
         return ExitCode::FAILURE;
     }
+    let file_path = file_path.unwrap();
     let port_name = match available_ports() {
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -187,7 +188,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (data, sig_file) = match get_files(file_path.as_ref().unwrap()) {
+    let (data, sig_file) = match get_files(&file_path) {
         Ok((data, sig_file)) => (data, sig_file),
         Err(e) => {
             eprintln!("Error acquiring file: {}", e);
@@ -240,7 +241,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             sig_file.write_all(&buffer).unwrap();
-            println!("Signature written to file: {}", file_path.unwrap() + ".sig");
+            println!("Signature written to file: {}", file_path.to_string() + ".sig");
         }
         // We are verifying the signature
         None => {
@@ -262,15 +263,35 @@ fn main() -> ExitCode {
                     .try_into()
                     .unwrap(),
             ) as i64;
-            let hash = &String::from_utf8_lossy(
+            let hash = decode_hex(&String::from_utf8_lossy(
                 &data[NONCE_LEN + 18..NONCE_LEN + 18 + Sha3_512::output_size() * 2],
-            );
+            )).unwrap();
             let timestamp = DateTime::from_timestamp(timestamp, 0).unwrap();
+            
+            // Compute original file hash
+            let mut hasher = Sha3_512::new();
+            let file_path = file_path.replace(".sig", "");
+            let mut file = match std::fs::File::open(&file_path) {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("Could not open base file ({}): {}", &file_path, e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            io::copy(&mut file, &mut hasher).unwrap();
+            let file_hash = hasher.finalize().to_vec();
+            
+            // Compare the hashes
+            if file_hash != hash {
+                eprintln!("Error: Signature does not match base file");
+                return ExitCode::FAILURE;
+            }
+
             println!(
-                "Signature verified successfully.\nCreation time: {}\nFile hash: {:?}",
-                timestamp.to_rfc2822(),
-                hash
+                "Signature verified successfully.\nCreation time: {}",
+                timestamp.to_rfc2822()
             );
+            println!("Matches file: {}", &file_path);
         }
     }
     return ExitCode::SUCCESS;
