@@ -1,9 +1,10 @@
 use serialport::{available_ports, Error, SerialPort, SerialPortInfo, SerialPortType};
 use sha3::{Digest, Sha3_512};
 use std::{
+    io::Write,
     process::ExitCode,
     thread::sleep,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     vec,
 };
 
@@ -102,14 +103,22 @@ fn send_and_read_resp(
 }
 
 fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::io::Error> {
-    let data = std::fs::read(file_path)?;
-    if data.len() == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Empty file",
-        ));
-    }
+    let mut file = std::fs::File::open(file_path)?;
     if !file_path.ends_with(".sig") {
+        // timestamp + | + sha3_512 of file
+        let mut hasher = Sha3_512::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        let mut data: Vec<u8> = Vec::with_capacity(Sha3_512::output_size() + 10);
+        data.extend_from_slice(
+            &SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .to_le_bytes(),
+        );
+        data.extend_from_slice(&"|".as_bytes());
+        data.extend_from_slice(hasher.finalize().as_slice());
+
         // get a writeable handle at file_path + ".sig"
         let sig_file = std::fs::OpenOptions::new()
             .write(true)
@@ -117,6 +126,21 @@ fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::i
             .open(file_path.to_string() + ".sig")?;
         Ok((data, Some(sig_file)))
     } else {
+        // read the signature file
+        let mut data = std::fs::read(file_path)?;
+        let last_ch = data.last().unwrap();
+        if last_ch == &b'\n' || last_ch == &b'\r' {
+            data.pop();
+            if data.last().unwrap() == &b'\r' {
+                data.pop();
+            }
+        }
+        if data.len() % 2 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid signature file",
+            ));
+        }
         Ok((data, None))
     }
 }
@@ -127,13 +151,6 @@ fn main() -> ExitCode {
         eprintln!("Argument required: path to file to sign");
         return ExitCode::FAILURE;
     }
-    let (data, sig_file) = match get_files(&file_path.unwrap()) {
-        Ok((data, sig_file)) => (data, sig_file),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
     let port_name = match available_ports() {
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -160,12 +177,20 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let (data, sig_file) = match get_files(file_path.as_ref().unwrap()) {
+        Ok((data, sig_file)) => (data, sig_file),
+        Err(e) => {
+            eprintln!("Error acquiring file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Response buffer
     let mut buffer: Vec<u8> = Vec::with_capacity(10240);
 
     // Get device info
     if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, "AT+I\r\n".as_bytes(), 4) {
-        eprintln!("Error: {}", e);
+        eprintln!("Error getting device info: {}", e);
         return ExitCode::FAILURE;
     }
     let info_msg = String::from_utf8_lossy(&buffer);
@@ -181,9 +206,48 @@ fn main() -> ExitCode {
         .parse::<usize>()
         .unwrap();
     // Check if device capacity is sufficient to handle sha3_512 + timestamp + separator + newline
-    if max_msg_len < Sha3_512::output_size() + 16 + 2 {
+    if max_msg_len < Sha3_512::output_size() + 8 + 2 {
         eprintln!("Error: Device message capacity insufficient");
         return ExitCode::FAILURE;
+    }
+    match sig_file {
+        // We are signing the file
+        Some(mut sig_file) => {
+            let mut cmd = "AT+S ".as_bytes().to_vec();
+            let hex_data = data
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>();
+            cmd.extend_from_slice(hex_data.as_bytes());
+            cmd.extend_from_slice("\n".as_bytes());
+            buffer.clear();
+            if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd, 1) {
+                eprintln!("Error while signing: {}", e);
+                return ExitCode::FAILURE;
+            }
+            if String::from_utf8_lossy(&buffer).contains("ERROR") {
+                eprintln!("Signature creation failed");
+                return ExitCode::FAILURE;
+            }
+            sig_file.write_all(&buffer).unwrap();
+            println!("Signature written to file: {}", file_path.unwrap() + ".sig");
+        }
+        // We are verifying the signature
+        None => {
+            let mut cmd = "AT+V ".as_bytes().to_vec();
+            cmd.extend_from_slice(&data);
+            cmd.extend_from_slice("\n".as_bytes());
+            buffer.clear();
+            if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd, 1) {
+                eprintln!("Error while verifying: {}", e);
+                return ExitCode::FAILURE;
+            }
+            if String::from_utf8_lossy(&buffer).contains("ERROR") {
+                eprintln!("Signature verification failed");
+                return ExitCode::FAILURE;
+            }
+            println!("Signature verified successfully");
+        }
     }
     return ExitCode::SUCCESS;
 }
