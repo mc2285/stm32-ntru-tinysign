@@ -1,6 +1,6 @@
 use chrono::DateTime;
 use serialport::{available_ports, Error, SerialPort, SerialPortInfo, SerialPortType};
-use sha3::{Digest, Sha3_512};
+use blake2::{Digest, Blake2b512};
 use std::{
     io::{self, Write},
     process::ExitCode,
@@ -108,10 +108,10 @@ fn send_and_read_resp(
 fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::io::Error> {
     let mut file = std::fs::File::open(file_path)?;
     if !file_path.ends_with(".sig") {
-        // timestamp + | + sha3_512 of file
-        let mut hasher = Sha3_512::new();
+        // timestamp + | + Blake2b512 of file
+        let mut hasher = Blake2b512::new();
         std::io::copy(&mut file, &mut hasher)?;
-        let mut data: Vec<u8> = Vec::with_capacity(Sha3_512::output_size() + 10);
+        let mut data: Vec<u8> = Vec::with_capacity(Blake2b512::output_size() + 10);
         data.extend_from_slice(
             &SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -134,7 +134,7 @@ fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::i
         while *data.last().unwrap() == b'\n' || *data.last().unwrap() == b'\r' {
             data.pop();
         }
-        if data.len() % 2 != 0 || data.len() < NONCE_LEN + Sha3_512::output_size() * 2 + 4 {
+        if data.len() % 2 != 0 || data.len() < NONCE_LEN + Blake2b512::output_size() * 2 + 4 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid signature file",
@@ -212,8 +212,8 @@ fn main() -> ExitCode {
         .unwrap()
         .parse::<usize>()
         .unwrap();
-    // Check if device capacity is sufficient to handle sha3_512 + timestamp + separator + newline
-    if max_msg_len < Sha3_512::output_size() + 8 + 2 {
+    // Check if device capacity is sufficient to handle Blake2b512 + timestamp + separator + newline
+    if max_msg_len < Blake2b512::output_size() + 8 + 2 {
         eprintln!("Error: Device message capacity insufficient");
         return ExitCode::FAILURE;
     }
@@ -269,7 +269,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let hash = decode_hex(&String::from_utf8_lossy(
-                &data[NONCE_LEN + 18..NONCE_LEN + 18 + Sha3_512::output_size() * 2],
+                &data[NONCE_LEN + 18..NONCE_LEN + 18 + Blake2b512::output_size() * 2],
             )).unwrap();
             let timestamp = match DateTime::from_timestamp(timestamp, 0) {
                 Some(t) => t,
@@ -280,7 +280,7 @@ fn main() -> ExitCode {
             };
 
             // Compute original file hash
-            let mut hasher = Sha3_512::new();
+            let mut hasher = Blake2b512::new();
             let file_path = file_path.replace(".sig", "");
             let mut file = match std::fs::File::open(&file_path) {
                 Ok(file) => file,
