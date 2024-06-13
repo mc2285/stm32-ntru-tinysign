@@ -1,3 +1,4 @@
+use chrono::DateTime;
 use serialport::{available_ports, Error, SerialPort, SerialPortInfo, SerialPortType};
 use sha3::{Digest, Sha3_512};
 use std::{
@@ -12,6 +13,8 @@ const SERIAL_TIMEOUT: std::time::Duration = Duration::from_millis(400);
 const INIT_TIMEOUT: std::time::Duration = Duration::from_millis(1500);
 const CMD_TIMEOUT: std::time::Duration = Duration::from_millis(3000);
 const PROBE_GRANUALITY: std::time::Duration = Duration::from_millis(25);
+
+const NONCE_LEN: usize = (40 + 2) * 2;
 
 /// Locates a device with the correct VID/PID and manufacturer/product
 /// strings in the list of ports returned by `serialport::available_ports`
@@ -145,6 +148,13 @@ fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::i
     }
 }
 
+pub fn decode_hex(s: &str) -> Result<Vec<u8>, std::num::ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect()
+}
+
 fn main() -> ExitCode {
     let file_path = std::env::args().nth(1);
     if let None = file_path {
@@ -246,7 +256,21 @@ fn main() -> ExitCode {
                 eprintln!("Signature verification failed");
                 return ExitCode::FAILURE;
             }
-            println!("Signature verified successfully");
+            let timestamp = u64::from_le_bytes(
+                decode_hex(&String::from_utf8_lossy(&data[NONCE_LEN..NONCE_LEN + 16]))
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ) as i64;
+            let hash = &String::from_utf8_lossy(
+                &data[NONCE_LEN + 18..NONCE_LEN + 18 + Sha3_512::output_size() * 2],
+            );
+            let timestamp = DateTime::from_timestamp(timestamp, 0).unwrap();
+            println!(
+                "Signature verified successfully.\nCreation time: {}\nFile hash: {:?}",
+                timestamp.to_rfc2822(),
+                hash
+            );
         }
     }
     return ExitCode::SUCCESS;
