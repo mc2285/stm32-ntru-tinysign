@@ -254,7 +254,7 @@ fn main() -> ExitCode {
                 eprintln!("Error while verifying: {}", e);
                 return ExitCode::FAILURE;
             }
-            if String::from_utf8_lossy(&buffer).contains("ERROR") {
+            if !String::from_utf8_lossy(&buffer).contains("OK") {
                 eprintln!("Signature is invalid");
                 return ExitCode::FAILURE;
             }
