@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 "serialport" = "4.3"
+"sha3" = "0.10"

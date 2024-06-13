@@ -1,5 +1,11 @@
 use serialport::{available_ports, Error, SerialPort, SerialPortInfo, SerialPortType};
-use std::{process::ExitCode, thread::sleep, time::{Duration, Instant}, vec};
+use sha3::{Digest, Sha3_512};
+use std::{
+    process::ExitCode,
+    thread::sleep,
+    time::{Duration, Instant},
+    vec,
+};
 
 const SERIAL_TIMEOUT: std::time::Duration = Duration::from_millis(400);
 const INIT_TIMEOUT: std::time::Duration = Duration::from_millis(1500);
@@ -36,7 +42,7 @@ fn init_communication(port: &mut Box<dyn SerialPort>) -> Result<(), Error> {
         match port.read(&mut buf) {
             Ok(n_read) => {
                 if n_read > 0 {
-                    res.extend_from_slice(&buf);
+                    res.extend_from_slice(&buf[..n_read]);
                     buf = vec![0; 64];
                 }
             }
@@ -65,9 +71,9 @@ fn send_and_read_resp(
     let start = Instant::now();
     loop {
         match port.read(&mut buf) {
-            Ok(n_read)  => {
+            Ok(n_read) => {
                 if n_read > 0 {
-                    res.extend_from_slice(&buf);
+                    res.extend_from_slice(&buf[..n_read]);
                     n -= buf.iter().filter(|&&c| c == b'\n').count() as i32;
                     buf = vec![0; 64];
                 }
@@ -76,15 +82,13 @@ fn send_and_read_resp(
         }
         if n <= 0 {
             while n <= 0 {
-                if res[res.len()-1] == b'\n' {
+                if res[res.len() - 1] == b'\n' {
                     res.pop();
-                    if res[res.len()-2] == b'\r'
-                    {
+                    if res[res.len() - 2] == b'\r' {
                         res.pop();
                     }
                     n += 1;
-                }
-                else {
+                } else {
                     res.pop();
                 }
             }
@@ -97,7 +101,39 @@ fn send_and_read_resp(
     }
 }
 
+fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::io::Error> {
+    let data = std::fs::read(file_path)?;
+    if data.len() == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Empty file",
+        ));
+    }
+    if !file_path.ends_with(".sig") {
+        // get a writeable handle at file_path + ".sig"
+        let sig_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(file_path.to_string() + ".sig")?;
+        Ok((data, Some(sig_file)))
+    } else {
+        Ok((data, None))
+    }
+}
+
 fn main() -> ExitCode {
+    let file_path = std::env::args().nth(1);
+    if let None = file_path {
+        eprintln!("Argument required: path to file to sign");
+        return ExitCode::FAILURE;
+    }
+    let (data, sig_file) = match get_files(&file_path.unwrap()) {
+        Ok((data, sig_file)) => (data, sig_file),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
     let port_name = match available_ports() {
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -126,14 +162,28 @@ fn main() -> ExitCode {
 
     // Response buffer
     let mut buffer: Vec<u8> = Vec::with_capacity(10240);
-    let cmd = "AT+I\r\n".as_bytes();
-    if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd, 4) {
+
+    // Get device info
+    if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, "AT+I\r\n".as_bytes(), 4) {
         eprintln!("Error: {}", e);
         return ExitCode::FAILURE;
     }
-    println!(
-        "Found a token! Device info: \n{}",
-        String::from_utf8_lossy(&buffer)
-    );
+    let info_msg = String::from_utf8_lossy(&buffer);
+    println!("Found a token! Device info: \n{}", info_msg);
+    // Get maximum accepted message length from device info
+    let max_msg_len = info_msg
+        .lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    // Check if device capacity is sufficient to handle sha3_512 + timestamp + separator + newline
+    if max_msg_len < Sha3_512::output_size() + 16 + 2 {
+        eprintln!("Error: Device message capacity insufficient");
+        return ExitCode::FAILURE;
+    }
     return ExitCode::SUCCESS;
 }
