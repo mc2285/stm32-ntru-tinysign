@@ -86,12 +86,12 @@ fn send_and_read_resp(
         }
         if n <= 0 {
             while n <= 0 {
-                if res[res.len() - 1] == b'\n' {
-                    res.pop();
-                    if res[res.len() - 2] == b'\r' {
+                let last_ch = *res.last().unwrap_or(&b'\0');
+                if last_ch == b'\n' || last_ch == b'\r'{
+                    while *res.last().unwrap_or(&b'\0') == b'\n' || *res.last().unwrap_or(&b'\0') == b'\r' {
                         res.pop();
                     }
-                    n += 1;
+                n += 1;
                 } else {
                     res.pop();
                 }
@@ -131,14 +131,10 @@ fn get_files(file_path: &str) -> Result<(Vec<u8>, Option<std::fs::File>), std::i
     } else {
         // read the signature file
         let mut data = std::fs::read(file_path)?;
-        let last_ch = data.last().unwrap();
-        if last_ch == &b'\n' || last_ch == &b'\r' {
+        while *data.last().unwrap() == b'\n' || *data.last().unwrap() == b'\r' {
             data.pop();
-            if data.last().unwrap() == &b'\r' {
-                data.pop();
-            }
         }
-        if data.len() % 2 != 0 {
+        if data.len() % 2 != 0 || data.len() < NONCE_LEN + Sha3_512::output_size() * 2 + 4 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid signature file",
@@ -205,7 +201,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let info_msg = String::from_utf8_lossy(&buffer);
-    println!("Found a token! Device info: \n{}", info_msg);
+    println!("Found a token! Device info: \r\n{}", info_msg);
     // Get maximum accepted message length from device info
     let max_msg_len = info_msg
         .lines()
@@ -230,7 +226,7 @@ fn main() -> ExitCode {
                 .map(|b| format!("{:02x}", b))
                 .collect::<String>();
             cmd.extend_from_slice(hex_data.as_bytes());
-            cmd.extend_from_slice("\n".as_bytes());
+            cmd.extend_from_slice("\r\n".as_bytes());
             buffer.clear();
             if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd, 1) {
                 eprintln!("Error while signing: {}", e);
@@ -240,34 +236,49 @@ fn main() -> ExitCode {
                 eprintln!("Signature creation failed");
                 return ExitCode::FAILURE;
             }
-            sig_file.write_all(&buffer).unwrap();
+            buffer.extend_from_slice("\r\n".as_bytes());
+            if let Err(e) = sig_file.write_all(&buffer)
+            {
+                eprintln!("Error writing signature to file: {}", e);
+                return ExitCode::FAILURE;
+            }
             println!("Signature written to file: {}", file_path.to_string() + ".sig");
         }
         // We are verifying the signature
         None => {
             let mut cmd = "AT+V ".as_bytes().to_vec();
             cmd.extend_from_slice(&data);
-            cmd.extend_from_slice("\n".as_bytes());
+            cmd.extend_from_slice("\r\n".as_bytes());
             buffer.clear();
             if let Err(e) = send_and_read_resp(&mut handle, &mut buffer, &cmd, 1) {
                 eprintln!("Error while verifying: {}", e);
                 return ExitCode::FAILURE;
             }
             if String::from_utf8_lossy(&buffer).contains("ERROR") {
-                eprintln!("Signature verification failed");
+                eprintln!("Signature is invalid");
                 return ExitCode::FAILURE;
             }
             let timestamp = u64::from_le_bytes(
                 decode_hex(&String::from_utf8_lossy(&data[NONCE_LEN..NONCE_LEN + 16]))
-                    .unwrap()
+                    .unwrap_or(vec![0; 8])
                     .try_into()
-                    .unwrap(),
+                    .unwrap_or([0; 8]),
             ) as i64;
+            if timestamp == 0 {
+                eprintln!("Error: Malformed timestamp in signature");
+                return ExitCode::FAILURE;
+            }
             let hash = decode_hex(&String::from_utf8_lossy(
                 &data[NONCE_LEN + 18..NONCE_LEN + 18 + Sha3_512::output_size() * 2],
             )).unwrap();
-            let timestamp = DateTime::from_timestamp(timestamp, 0).unwrap();
-            
+            let timestamp = match DateTime::from_timestamp(timestamp, 0) {
+                Some(t) => t,
+                None => {
+                    eprintln!("Error: Invalid timestamp in signature");
+                    return ExitCode::FAILURE;
+                }
+            };
+
             // Compute original file hash
             let mut hasher = Sha3_512::new();
             let file_path = file_path.replace(".sig", "");
@@ -288,7 +299,7 @@ fn main() -> ExitCode {
             }
 
             println!(
-                "Signature verified successfully.\nCreation time: {}",
+                "Signature verified successfully.\r\nCreation time: {}",
                 timestamp.to_rfc2822()
             );
             println!("Matches file: {}", &file_path);
